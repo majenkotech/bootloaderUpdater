@@ -4,9 +4,14 @@
 #include "Bootloaders/CHIPKIT_UC32.h"
 #include "Bootloaders/CHIPKIT_UNO32.h"
 #include "Bootloaders/MAJENKO_LENNY.h"
+#include "Bootloaders/MECANIQUE_FIREWING.h"
 
 #ifdef GOT_INTERNAL_BOOTLOADER
 #define BOOTLOADER_LEN (sizeof(bootloaderHex) / sizeof(bootloaderHex[0]))
+#endif
+
+#if defined(__PIC32MX1XX__) || defined(__PIC32MX2XX__)
+#error Sorry, there is a problem writing to boot flash on the PIC32MX1xx/2xx chips.
 #endif
 
 static const uint32_t PROC_OK = 0;
@@ -19,9 +24,12 @@ static const uint32_t nvmopWriteWord    = 0x4001;
 static const uint32_t nvmopWriteRow     = 0x4003;
 static const uint32_t nvmopErasePage    = 0x4004;
 
+static const uint32_t PAGE_RO           = 0x0001;
+
 struct page {
 	uint32_t startAddress;
 	struct page *next;
+	uint32_t flags;
 	uint32_t data[_EEPROM_PAGE_SIZE];
 };
 
@@ -90,6 +98,10 @@ bool __attribute__((nomips16)) doNvmOp(uint32_t nvmop) {
 	intSt = disableInterrupts();
 	NVMCON = NVMCON_WREN | nvmop;
 	tm = _CP0_GET_COUNT();
+
+	while (1) {
+		asm volatile("nop");
+	}
 
 	while (_CP0_GET_COUNT() - tm < ((F_CPU * 6) / 2000000));
 
@@ -160,7 +172,6 @@ int parseHex(const char *line) {
 		return PROC_CSUM;
 	}
 
-//	Serial.printf("Record type: %d Address: 0x%04X Length: %d\r\n", recordType, recordAddress, recordLength);
 	struct page *p;
 
 	switch (recordType) {
@@ -219,9 +230,9 @@ bool loadInternalBootloader() {
 
 	return true;
 #else
-    Serial.println("Sorry, there is no internal bootloader for your board.");
-    Serial.println("You will have to manually upload one.");
-    return false;
+	Serial.println("Sorry, there is no internal bootloader for your board.");
+	Serial.println("You will have to manually upload one.");
+	return false;
 #endif
 }
 
@@ -314,9 +325,10 @@ void setup() {
 		}
 	}
 
-    Serial.print("Page size: ");
-    Serial.println(_EEPROM_PAGE_SIZE);
-
+	//Serial.println("Write protecting config bits...");
+	//Serial.flush();
+	//struct page *p = fetchPage((uint32_t)&DEVCFG0);
+	//p->flags |= PAGE_RO;
 	Serial.println();
 	Serial.println("Ready to burn bootloader. Type 'burn' to continue.");
 
@@ -331,15 +343,21 @@ void setup() {
 	Serial.println("Burning now...");
 
 	for (struct page *scan = bootloader; scan; scan = scan->next) {
+		if (scan->flags & PAGE_RO) {
+			Serial.print("Skipping 0x");
+			Serial.println(scan->startAddress, HEX);
+			Serial.flush();
+			continue;
+		}
+
 		Serial.print("Erasing 0x");
 		Serial.println(scan->startAddress, HEX);
-        Serial.flush();
+		Serial.flush();
 		NVMADDR = KVA_TO_PA(scan->startAddress);
 		doNvmOp(nvmopErasePage);
-		delay(10);
 		Serial.print("Programming 0x");
 		Serial.println(scan->startAddress, HEX);
-        Serial.flush();
+		Serial.flush();
 
 		for (int i = 0; i < _EEPROM_PAGE_SIZE; i++) {
 			NVMADDR = KVA_TO_PA(scan->startAddress + (i * 4));
