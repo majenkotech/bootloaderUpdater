@@ -10,9 +10,9 @@
 #define BOOTLOADER_LEN (sizeof(bootloaderHex) / sizeof(bootloaderHex[0]))
 #endif
 
-#if defined(__PIC32MX1XX__) || defined(__PIC32MX2XX__)
-#error Sorry, there is a problem writing to boot flash on the PIC32MX1xx/2xx chips.
-#endif
+//#if defined(__PIC32MX1XX__) || defined(__PIC32MX2XX__)
+//#error Sorry, there is a problem writing to boot flash on the PIC32MX1xx/2xx chips.
+//#endif
 
 static const uint32_t PROC_OK = 0;
 static const uint32_t PROC_END = 1;
@@ -93,15 +93,14 @@ struct page *fetchPage(uint32_t address, bool allocate = true) {
 bool __attribute__((nomips16)) doNvmOp(uint32_t nvmop) {
 	int         intSt;
 	uint32_t    tm;
-	// M00TODO: When DMA operations are supported in the core, need
-	// to add code here to suspend DMA during the NVM operation.
-	intSt = disableInterrupts();
+
+    intSt = disableInterrupts();
+
+
+    digitalWrite(PIN_LED1, HIGH);
+
 	NVMCON = NVMCON_WREN | nvmop;
 	tm = _CP0_GET_COUNT();
-
-	while (1) {
-		asm volatile("nop");
-	}
 
 	while (_CP0_GET_COUNT() - tm < ((F_CPU * 6) / 2000000));
 
@@ -114,8 +113,11 @@ bool __attribute__((nomips16)) doNvmOp(uint32_t nvmop) {
 	}
 
 	NVMCONCLR = NVMCON_WREN;
-	//M00TODO: Resume a suspended DMA operation
-	restoreInterrupts(intSt);
+
+    digitalWrite(PIN_LED1, LOW);
+
+    restoreInterrupts(intSt);
+	
 	return (NVMCON & (_NVMCON_WRERR_MASK | _NVMCON_LVDERR_MASK)) ? true : false;
 }
 
@@ -301,7 +303,40 @@ void splash() {
 	Serial.println("HEX file from your hard drive.");
 }
 
+void selectClock(bool internal) {    
+#if defined(__PIC32MX1XX__) || defined(__PIC32MX2XX__)
+    static uint32_t osc = OSCCONbits.COSC;
+
+    if (internal) {
+        delay(100);
+        int f = disableInterrupts();
+
+        SYSKEY = 0x0;
+        SYSKEY = 0xAA996655;
+        SYSKEY = 0x556699AA;
+        OSCCONbits.NOSC = 0; // FRC
+        OSCCONbits.OSWEN = 1;
+        SYSKEY = 0x0;
+        restoreInterrupts(f);
+        while (OSCCONbits.OSWEN == 1);
+    } else {
+        int f = disableInterrupts();
+        SYSKEY = 0x0;
+        SYSKEY = 0xAA996655;
+        SYSKEY = 0x556699AA;
+        OSCCONbits.NOSC = osc; // FRC
+        OSCCONbits.OSWEN = 1;
+        SYSKEY = 0x0;
+        restoreInterrupts(f);
+        while (OSCCONbits.OSWEN == 1);
+        delay(100);
+    }
+#endif
+}
+
 void setup() {
+    pinMode(PIN_LED1, OUTPUT);
+    digitalWrite(PIN_LED1, LOW);
 	Serial.begin(115200);
 	splash();
 	bool ret = false;
@@ -329,7 +364,17 @@ void setup() {
 	//Serial.flush();
 	//struct page *p = fetchPage((uint32_t)&DEVCFG0);
 	//p->flags |= PAGE_RO;
+#ifdef _USE_USB_FOR_SERIAL_
 	Serial.println();
+    Serial.println("------------------- IMPORTANT ------------------------");
+    Serial.println("You are using a direct-USB connected board. The USB");
+    Serial.println("communications will break during the burning process.");
+    Serial.println("This is normal. After typing 'burn' below the LED on");
+    Serial.println("your board will flash a few times before switching off.");
+    Serial.println("Once it has stopped flashing the burn process is complete");
+    Serial.println("and you can reset the board to test the bootloader.");
+#endif
+    Serial.println();
 	Serial.println("Ready to burn bootloader. Type 'burn' to continue.");
 
 	while (blockingRead() != 'b');
@@ -349,29 +394,35 @@ void setup() {
 			Serial.flush();
 			continue;
 		}
-
-		Serial.print("Erasing 0x");
-		Serial.println(scan->startAddress, HEX);
-		Serial.flush();
-		NVMADDR = KVA_TO_PA(scan->startAddress);
-		doNvmOp(nvmopErasePage);
+#ifndef _USE_USB_FOR_SERIAL_
 		Serial.print("Programming 0x");
 		Serial.println(scan->startAddress, HEX);
 		Serial.flush();
+#endif
+        selectClock(true);
+
+        NVMADDR = KVA_TO_PA(scan->startAddress);
+        doNvmOp(nvmopErasePage);
 
 		for (int i = 0; i < _EEPROM_PAGE_SIZE; i++) {
 			NVMADDR = KVA_TO_PA(scan->startAddress + (i * 4));
 			NVMDATA = scan->data[i];
 			doNvmOp(nvmopWriteWord);
 		}
+        selectClock(false);
 	}
 
+
+#ifdef _USE_USB_FOR_SERIAL_
+    executeSoftReset(ENTER_BOOTLOADER_ON_BOOT);
+#else
 	Serial.println("All done.");
 	Serial.flush();
 	Serial.println();
 	Serial.println("Press any key to reboot");
 	(void)blockingRead();
 	executeSoftReset(0);
+#endif
 }
 
 void loop() {
