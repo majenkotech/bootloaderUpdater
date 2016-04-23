@@ -25,6 +25,10 @@ static const uint32_t nvmopWriteRow     = 0x4003;
 static const uint32_t nvmopErasePage    = 0x4004;
 
 static const uint32_t PAGE_RO           = 0x0001;
+static const uint32_t PAGE_FRC          = 0x0002;
+
+// Convert an address into a page offset 
+#define ADD_TO_PO(X) (((uint32_t)((X))>>2) & (_EEPROM_PAGE_SIZE-1))
 
 struct page {
 	uint32_t startAddress;
@@ -307,6 +311,7 @@ void selectClock(bool internal) {
 #if defined(__PIC32MX1XX__) || defined(__PIC32MX2XX__)
     static uint32_t osc = OSCCONbits.COSC;
 
+
     if (internal) {
         delay(100);
         int f = disableInterrupts();
@@ -314,11 +319,14 @@ void selectClock(bool internal) {
         SYSKEY = 0x0;
         SYSKEY = 0xAA996655;
         SYSKEY = 0x556699AA;
-        OSCCONbits.NOSC = 0; // FRC
+        OSCCONbits.NOSC = 0b111; // FRC + DIV2
         OSCCONbits.OSWEN = 1;
-        SYSKEY = 0x0;
+        SYSKEY = 0x33333333;
         restoreInterrupts(f);
         while (OSCCONbits.OSWEN == 1);
+        // Change the baud rate calculation for the new speed.
+        Serial.end();
+        Serial.begin(9600 * (F_CPU / 4000000));
     } else {
         int f = disableInterrupts();
         SYSKEY = 0x0;
@@ -326,7 +334,7 @@ void selectClock(bool internal) {
         SYSKEY = 0x556699AA;
         OSCCONbits.NOSC = osc; // FRC
         OSCCONbits.OSWEN = 1;
-        SYSKEY = 0x0;
+        SYSKEY = 0x33333333;
         restoreInterrupts(f);
         while (OSCCONbits.OSWEN == 1);
         delay(100);
@@ -335,9 +343,12 @@ void selectClock(bool internal) {
 }
 
 void setup() {
+
+    
     pinMode(PIN_LED1, OUTPUT);
     digitalWrite(PIN_LED1, LOW);
-	Serial.begin(115200);
+	Serial.begin(9600);
+    
 	splash();
 	bool ret = false;
 
@@ -362,8 +373,15 @@ void setup() {
 
 	//Serial.println("Write protecting config bits...");
 	//Serial.flush();
-	//struct page *p = fetchPage((uint32_t)&DEVCFG0);
-	//p->flags |= PAGE_RO;
+	struct page *p = fetchPage((uint32_t)&DEVCFG0);
+	p->flags |= PAGE_FRC;
+
+    p->data[ADD_TO_PO(&DEVCFG1)] &= 0xFFFF3FFF; // Force clock switching on
+
+    p->data[ADD_TO_PO(&DEVCFG3)] &= 0xFFFF0000; // Blank the User ID
+    p->data[ADD_TO_PO(&DEVCFG3)] |= (DEVCFG3 & 0xFFFF); // Replace with existing one
+
+   
 #ifdef _USE_USB_FOR_SERIAL_
 	Serial.println();
     Serial.println("------------------- IMPORTANT ------------------------");
@@ -394,12 +412,12 @@ void setup() {
 			Serial.flush();
 			continue;
 		}
-#ifndef _USE_USB_FOR_SERIAL_
+        if (scan->flags & PAGE_FRC) {
+            selectClock(true);
+        }
 		Serial.print("Programming 0x");
 		Serial.println(scan->startAddress, HEX);
 		Serial.flush();
-#endif
-        selectClock(true);
 
         NVMADDR = KVA_TO_PA(scan->startAddress);
         doNvmOp(nvmopErasePage);
@@ -409,11 +427,18 @@ void setup() {
 			NVMDATA = scan->data[i];
 			doNvmOp(nvmopWriteWord);
 		}
-        selectClock(false);
+        if (scan->flags & PAGE_FRC) {
+//            selectClock(false);
+        }
 	}
 
-
 #ifdef _USE_USB_FOR_SERIAL_
+    for (int i = 0; i < 10; i++) {
+        digitalWrite(PIN_LED1, HIGH);
+        delay(100 / (F_CPU / 4000000));
+        digitalWrite(PIN_LED1, LOW);
+        delay(400 / (F_CPU / 4000000));
+    }
     executeSoftReset(ENTER_BOOTLOADER_ON_BOOT);
 #else
 	Serial.println("All done.");
@@ -421,7 +446,7 @@ void setup() {
 	Serial.println();
 	Serial.println("Press any key to reboot");
 	(void)blockingRead();
-	executeSoftReset(0);
+	executeSoftReset(ENTER_BOOTLOADER_ON_BOOT);
 #endif
 }
 
