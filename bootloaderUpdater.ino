@@ -1,4 +1,5 @@
 #include <sys/kmem.h>
+#include <CLI.h>
 
 #include "Bootloaders/CHIPKIT_MAX32.h"
 #include "Bootloaders/CHIPKIT_UC32.h"
@@ -9,10 +10,6 @@
 #ifdef GOT_INTERNAL_BOOTLOADER
 #define BOOTLOADER_LEN (sizeof(bootloaderHex) / sizeof(bootloaderHex[0]))
 #endif
-
-//#if defined(__PIC32MX1XX__) || defined(__PIC32MX2XX__)
-//#error Sorry, there is a problem writing to boot flash on the PIC32MX1xx/2xx chips.
-//#endif
 
 static const uint32_t PROC_OK = 0;
 static const uint32_t PROC_END = 1;
@@ -41,15 +38,16 @@ struct page *bootloader = NULL;
 uint32_t currentOffset = 0;
 uint32_t pageCount = 0;
 
-struct page *allocateNewPage(uint32_t address) {
+uint32_t UUID = 0;
+
+struct page *allocateNewPage(Stream *dev, uint32_t address) {
 	pageCount++;
-	Serial.printf("Loading page 0x%08x\r\n", address);
+	dev->printf("Loading page 0x%08x\r\n", address);
 	struct page *p = (struct page *)malloc(sizeof(struct page));
 
 	if (p == NULL) {
-		Serial.println("Unable to allocate memory!");
-
-		while (1);
+		dev->println("Unable to allocate memory!");
+	    return NULL;
 	}
 
 	p->startAddress = address;
@@ -62,15 +60,12 @@ struct page *allocateNewPage(uint32_t address) {
 	return p;
 }
 
-struct page *fetchPage(uint32_t address, bool allocate = true) {
+struct page *fetchPage(Stream *dev, uint32_t address) {
 	address = KVA_TO_PA(address);
 	uint32_t pageAddress = address & ~((_EEPROM_PAGE_SIZE * 4) - 1);
 
 	if (bootloader == NULL) {
-		if (allocate) {
-			bootloader = allocateNewPage(pageAddress);
-		}
-
+		bootloader = allocateNewPage(dev, pageAddress);
 		return bootloader;
 	}
 
@@ -82,11 +77,7 @@ struct page *fetchPage(uint32_t address, bool allocate = true) {
 		}
 	}
 
-	if (!allocate) {
-		return NULL;
-	}
-
-	struct page *newPage = allocateNewPage(pageAddress);
+	struct page *newPage = allocateNewPage(dev, pageAddress);
 
 	for (scan = bootloader; scan->next; scan = scan->next);
 
@@ -151,7 +142,7 @@ static inline uint32_t h2d8le(uint8_t h1, uint8_t h2, uint8_t h3, uint8_t h4, ui
 	return (h2d(h7) << 28) | (h2d(h8) << 24) | (h2d(h5) << 20) | (h2d(h6) << 16) | (h2d(h3) << 12) | (h2d(h4) << 8) | (h2d(h1) << 4) | h2d(h2);
 }
 
-int parseHex(const char *line) {
+int parseHex(Stream *dev, const char *line) {
 	if (strlen(line) == 0) {
 		return PROC_IGNORE;
 	}
@@ -183,7 +174,11 @@ int parseHex(const char *line) {
 	switch (recordType) {
 		case 0: // Data
 			fullAddress = currentOffset + recordAddress;
-			p = fetchPage(fullAddress);
+			p = fetchPage(dev, fullAddress);
+            if (p == NULL) {
+                dev->println("Error loading page");
+                return 20;
+            }
 			pageOffset = (fullAddress >> 2) & (_EEPROM_PAGE_SIZE - 1);
 
 			for (int x = 0; x < recordLength * 2; x += 8) {
@@ -204,56 +199,68 @@ int parseHex(const char *line) {
 	return PROC_OK;
 }
 
-void dumpPage(struct page *p) {
-	Serial.println();
-	Serial.printf("Page start 0x%02X\r\n", p->startAddress);
+static inline char cleanChar(char c) {
+    if (c < ' ') return '.';
+    if (c > 126) return '.';
+    return c;
+}
+
+void dumpPage(Stream *dev, struct page *p) {
+	dev->println();
+	dev->printf("Page start 0x%02X\r\n", p->startAddress);
 
 	for (int i = 0; i < _EEPROM_PAGE_SIZE; i += 4) {
-		Serial.printf("%04x: %08X %08X %08X %08X\r\n", i, p->data[i], p->data[i + 1], p->data[i + 2], p->data[i + 3]);
+		dev->printf("%04x: %08X %08X %08X %08X %c%c%c%c %c%c%c%c %c%c%c%c %c%c%c%c\r\n", i*4, p->data[i], p->data[i + 1], p->data[i + 2], p->data[i + 3],
+		    cleanChar(p->data[i] >> 24), cleanChar(p->data[i] >> 16), cleanChar(p->data[i] >> 8), cleanChar(p->data[i]),
+            cleanChar(p->data[i+1] >> 24), cleanChar(p->data[i+1] >> 16), cleanChar(p->data[i+1] >> 8), cleanChar(p->data[i+1]),
+            cleanChar(p->data[i+2] >> 24), cleanChar(p->data[i+2] >> 16), cleanChar(p->data[i+2] >> 8), cleanChar(p->data[i+2]),
+            cleanChar(p->data[i+3] >> 24), cleanChar(p->data[i+3] >> 16), cleanChar(p->data[i+3] >> 8), cleanChar(p->data[i+3])
+		);
 	}
 }
 
-int blockingRead() {
-	while (!Serial.available());
+int blockingRead(Stream *dev) {
+	while (!dev->available());
 
-	return Serial.read();
+	return dev->read();
 }
 
-bool loadInternalBootloader() {
+bool loadInternalBootloader(Stream *dev) {
 #ifdef GOT_INTERNAL_BOOTLOADER
 	currentOffset = 0;
 	pageCount = 0;
 
 	for (int i = 0; i < BOOTLOADER_LEN; i++) {
-		int ret = parseHex(bootloaderHex[i]);
+		int ret = parseHex(dev, bootloaderHex[i]);
 
 		if (ret == PROC_CSUM) {
-			Serial.print("Checksum error at line ");
-			Serial.println(i);
+			dev->print("Checksum error at line ");
+			dev->println(i);
 			return false;
 		}
 	}
 
 	return true;
 #else
-	Serial.println("Sorry, there is no internal bootloader for your board.");
-	Serial.println("You will have to manually upload one.");
+	dev->println("Sorry, there is no internal bootloader for your");
+	dev->println("board. You will have to manually upload one using");
+	dev->println("the 'load ascii' command.");
 	return false;
 #endif
 }
 
-bool loadExternalBootloader() {
+bool loadExternalBootloader(Stream *dev) {
 	char line[80];
 	int pos = 0;
 	currentOffset = 0;
 	pageCount = 0;
 	int ret = 0;
 	int lineno = 0;
-	Serial.println("Send HEX file data now (Send ASCII)");
-	Serial.println("Press 'x' to abort");
+	dev->println("Send HEX file data now (Send ASCII)");
+	dev->println("Press 'x' to abort");
 
 	while (1) {
-		char c = blockingRead();
+		char c = blockingRead(dev);
 
 		switch (c) {
 			case 'x':
@@ -264,11 +271,11 @@ bool loadExternalBootloader() {
 
 			case '\n':
 				lineno++;
-				ret = parseHex(line);
+				ret = parseHex(dev, line);
 
 				if (ret == PROC_CSUM) {
-					Serial.print("Checksum error at line ");
-					Serial.println(lineno);
+					dev->print("Checksum error at line ");
+					dev->println(lineno);
 					return false;
 				}
 
@@ -291,20 +298,115 @@ bool loadExternalBootloader() {
 	}
 }
 
-void splash() {
-	Serial.println();
-	Serial.println();
-	Serial.println("Bootloader Update System");
-	Serial.println("(c) 2016 Majenko Technologies");
-	Serial.println();
-	Serial.println("This software comes with no warranty whatsoever. Use of it");
-	Serial.println("is entirely at the user's own risk. Majenko Technologies,");
-	Serial.println("chipKIT, nor any of its associates, members or partners,");
-	Serial.println("can be held responsible for problems arising from the use");
-	Serial.println("of this software.");
-	Serial.println();
-	Serial.println("Press I to use the internal bootloader, or U to upload a");
-	Serial.println("HEX file from your hard drive.");
+void clearOldBootloader() {
+    if (bootloader == NULL) {
+        return;
+    }
+
+    struct page *scan = bootloader;
+    while (scan) {
+        struct page *next = scan->next;
+        free(scan);
+        scan = next;
+    }
+    bootloader = NULL;
+    pageCount = 0;
+    
+}
+
+CLI_COMMAND(help) {
+    dev->println();
+    dev->println();
+    dev->println("Bootloader Update System");
+    dev->println("(c) 2016 Majenko Technologies");
+    dev->println();
+    dev->println("This software comes with no warranty whatsoever. Use of it");
+    dev->println("is entirely at the user's own risk. Majenko Technologies,");
+    dev->println("chipKIT, nor any of its associates, members or partners,");
+    dev->println("can be held responsible for problems arising from the use");
+    dev->println("of this software.");
+    dev->println();
+    dev->println("Commands:");
+    dev->println("  help              This screen.");
+    dev->println("  load <source>     Load bootloader from <source>");
+    dev->println("       internal     Load internally bundled bootloader");
+    dev->println("       ascii        Receive a plain text HEX file as ASCII");
+    dev->println("  info              Display current state information");
+    dev->println("  burn              Burn the loaded bootloader");
+    dev->println("  dump              Dump the bootloader to the screen");
+    dev->println("  userid <uid>      Set the board's UUID");
+    dev->println("  reboot            Reboot the board");
+    return 0;
+}
+
+CLI_COMMAND(dump) {
+    if (bootloader == NULL) {
+        dev->println("No bootloader loaded. Use the 'load' command first.");
+        return 10;
+    }
+
+    for (struct page *scan = bootloader; scan; scan = scan->next) {
+        dumpPage(dev, scan);
+    }
+    return 0;
+}
+
+CLI_COMMAND(userid) {
+    if (argc != 2) {
+        dev->println("Usage: 'userid <uid>' where '<uid>' id 4 hexadecimal digits 0000 to FFFF");
+        return 10;
+    }
+    if (strlen(argv[1]) != 4) {
+        dev->println("Usage: 'userid <uid>' where '<uid>' id 4 hexadecimal digits 0000 to FFFF");
+        return 10;        
+    }
+    UUID = h2d4be(argv[1][0], argv[1][1], argv[1][2], argv[1][3]);
+    dev->print("User ID:              0x");
+    dev->println(UUID, HEX);
+    return 0;    
+}
+
+CLI_COMMAND(load) {
+    if (argc != 2) {
+        dev->println("Usage: 'load <source>' where <source> is 'internal' or 'ascii'");
+        return 10;
+    }
+    if (!strcmp(argv[1], "internal")) {
+        clearOldBootloader();
+        if (!loadInternalBootloader(dev)) {
+            return 20;
+        }
+        return 0;
+    }
+    if (!strcmp(argv[1], "ascii")) {
+        clearOldBootloader();
+        if (!loadExternalBootloader(dev)) {
+            return 20;
+        }
+        return 0;
+    }
+    dev->println("Usage: load <source> where <source> is 'internal' or 'ascii'");
+    return 10;
+}
+
+CLI_COMMAND(info) {
+    dev->print("Bootloader loaded:    ");
+    if (bootloader == NULL) {
+        dev->println("Nothing loaded");
+    } else {
+        dev->print(pageCount);
+        dev->println(" pages loaded");
+    }
+    dev->print("User ID:              0x");
+    dev->println(UUID, HEX);
+    return 0;
+}
+
+extern "C" void _softwareReset();
+
+CLI_COMMAND(reboot) {
+    executeSoftReset(0);
+    return 0;
 }
 
 void selectClock(bool internal) {    
@@ -327,6 +429,10 @@ void selectClock(bool internal) {
         // Change the baud rate calculation for the new speed.
         Serial.end();
         Serial.begin(9600 * (F_CPU / 4000000));
+        #ifdef _USE_USB_FOR_SERIAL_
+        Serial0.end();
+        Serial0.begin(9600 * (F_CPU / 4000000));
+        #endif
     } else {
         int f = disableInterrupts();
         SYSKEY = 0x0;
@@ -342,113 +448,78 @@ void selectClock(bool internal) {
 #endif
 }
 
-void setup() {
+CLI_COMMAND(burn) {
+    if (bootloader == NULL) {
+        dev->println("No bootloader loaded. Use the 'load' command first.");
+        return 10;
+    }
+    dev->println("Burning now...");
 
-    
-    pinMode(PIN_LED1, OUTPUT);
-    digitalWrite(PIN_LED1, LOW);
-	Serial.begin(9600);
-    
-	splash();
-	bool ret = false;
-
-	while (ret == false) {
-		int ch = blockingRead();
-
-		while (ch != 'i' && ch != 'u') {
-			splash();
-			ch = blockingRead();
-		}
-
-		if (ch == 'i') {
-			ret = loadInternalBootloader();
-		} else {
-			ret = loadExternalBootloader();
-		}
-
-		if (!ret) {
-			Serial.println("*** Error loading bootloader!");
-		}
-	}
-
-	//Serial.println("Write protecting config bits...");
-	//Serial.flush();
-	struct page *p = fetchPage((uint32_t)&DEVCFG0);
-	p->flags |= PAGE_FRC;
+    struct page *p = fetchPage(dev, (uint32_t)&DEVCFG0);
+    if (p == NULL) {
+        dev->println("Unable to load configuration page");
+        return 10;
+    }
+    p->flags |= PAGE_FRC;
 
     p->data[ADD_TO_PO(&DEVCFG1)] &= 0xFFFF3FFF; // Force clock switching on
 
     p->data[ADD_TO_PO(&DEVCFG3)] &= 0xFFFF0000; // Blank the User ID
-    p->data[ADD_TO_PO(&DEVCFG3)] |= (DEVCFG3 & 0xFFFF); // Replace with existing one
+    p->data[ADD_TO_PO(&DEVCFG3)] |= (UUID & 0xFFFF); // Replace with existing one
 
-   
-#ifdef _USE_USB_FOR_SERIAL_
-	Serial.println();
-    Serial.println("------------------- IMPORTANT ------------------------");
-    Serial.println("You are using a direct-USB connected board. The USB");
-    Serial.println("communications will break during the burning process.");
-    Serial.println("This is normal. After typing 'burn' below the LED on");
-    Serial.println("your board will flash a few times before switching off.");
-    Serial.println("Once it has stopped flashing the burn process is complete");
-    Serial.println("and you can reset the board to test the bootloader.");
-#endif
-    Serial.println();
-	Serial.println("Ready to burn bootloader. Type 'burn' to continue.");
-
-	while (blockingRead() != 'b');
-
-	while (blockingRead() != 'u');
-
-	while (blockingRead() != 'r');
-
-	while (blockingRead() != 'n');
-
-	Serial.println("Burning now...");
-
-	for (struct page *scan = bootloader; scan; scan = scan->next) {
-		if (scan->flags & PAGE_RO) {
-			Serial.print("Skipping 0x");
-			Serial.println(scan->startAddress, HEX);
-			Serial.flush();
-			continue;
-		}
+    for (struct page *scan = bootloader; scan; scan = scan->next) {
+        if (scan->flags & PAGE_RO) {
+            dev->print("Skipping 0x");
+            dev->println(scan->startAddress, HEX);
+            dev->flush();
+            continue;
+        }
         if (scan->flags & PAGE_FRC) {
             selectClock(true);
         }
-		Serial.print("Programming 0x");
-		Serial.println(scan->startAddress, HEX);
-		Serial.flush();
+        dev->print("Programming 0x");
+        dev->println(scan->startAddress, HEX);
+        dev->flush();
 
         NVMADDR = KVA_TO_PA(scan->startAddress);
         doNvmOp(nvmopErasePage);
 
-		for (int i = 0; i < _EEPROM_PAGE_SIZE; i++) {
-			NVMADDR = KVA_TO_PA(scan->startAddress + (i * 4));
-			NVMDATA = scan->data[i];
-			doNvmOp(nvmopWriteWord);
-		}
+        for (int i = 0; i < _EEPROM_PAGE_SIZE; i++) {
+            NVMADDR = KVA_TO_PA(scan->startAddress + (i * 4));
+            NVMDATA = scan->data[i];
+            doNvmOp(nvmopWriteWord);
+        }
         if (scan->flags & PAGE_FRC) {
 //            selectClock(false);
         }
-	}
+    }
+}
+
+void setup() {
+
+    UUID = (DEVCFG3 & 0xFFFF);
+    
+    pinMode(PIN_LED1, OUTPUT);
+    digitalWrite(PIN_LED1, LOW);
+    CLI.setDefaultPrompt(_BOARD_NAME_ "> ");
+
+    Serial.begin(9600);
+    CLI.addClient(Serial);
 
 #ifdef _USE_USB_FOR_SERIAL_
-    for (int i = 0; i < 10; i++) {
-        digitalWrite(PIN_LED1, HIGH);
-        delay(100 / (F_CPU / 4000000));
-        digitalWrite(PIN_LED1, LOW);
-        delay(400 / (F_CPU / 4000000));
-    }
-    executeSoftReset(ENTER_BOOTLOADER_ON_BOOT);
-#else
-	Serial.println("All done.");
-	Serial.flush();
-	Serial.println();
-	Serial.println("Press any key to reboot");
-	(void)blockingRead();
-	executeSoftReset(ENTER_BOOTLOADER_ON_BOOT);
+    Serial0.begin(9600);
+    help(CLI.addClient(Serial0), 0, NULL);
 #endif
+    
+    CLI.addCommand("help", help);
+    CLI.addCommand("load", load);
+    CLI.addCommand("info", info);
+    CLI.addCommand("reboot", reboot);
+    CLI.addCommand("burn", burn);
+    CLI.addCommand("userid", userid);
+    CLI.addCommand("dump", dump);
 }
 
 void loop() {
+    CLI.process();
 }
